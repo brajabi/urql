@@ -1,221 +1,185 @@
-import uuid from 'uuid/v4';
+import Observable from 'zen-observable-ts';
 
-import { ICache, IClientOptions, IMutation, IQuery } from '../interfaces/index';
-import { gankTypeNamesFromResponse } from '../modules/typenames';
+import {
+  ClientEvent,
+  ClientEventType,
+  ICache,
+  IClientOptions,
+  IExchange,
+  IExchangeResult,
+  IQuery,
+} from '../interfaces/index';
+
+import { cacheExchange } from './cache-exchange';
+import { dedupExchange } from './dedup-exchange';
+import { defaultCache } from './default-cache';
 import { hashString } from './hash';
-
-// Response from executeQuery call
-export interface IQueryResponse {
-  data: object[];
-  typeNames?: string[];
-}
-
-const checkStatus = (redirectMode: string = 'follow') => (
-  response: Response
-) => {
-  // If using manual redirect mode, don't error on redirect!
-  const statusRangeEnd = redirectMode === 'manual' ? 400 : 300;
-  if (response.status >= 200 && response.status < statusRangeEnd) {
-    return response;
-  }
-  const err = new Error(response.statusText);
-  (err as any).response = response;
-  throw err;
-};
-
-export const defaultCache = store => {
-  return {
-    invalidate: hash =>
-      new Promise(resolve => {
-        delete store[hash];
-        resolve(hash);
-      }),
-    invalidateAll: () =>
-      new Promise(resolve => {
-        store = {};
-        resolve();
-      }),
-    read: hash =>
-      new Promise(resolve => {
-        resolve(store[hash] || null);
-      }),
-    update: callback =>
-      new Promise(resolve => {
-        if (typeof callback === 'function') {
-          Object.keys(store).forEach(key => {
-            callback(store, key, store[key]);
-          });
-        }
-        resolve();
-      }),
-    write: (hash, data) =>
-      new Promise(resolve => {
-        store[hash] = data;
-        resolve(hash);
-      }),
-  };
-};
+import { httpExchange } from './http-exchange';
 
 export default class Client {
-  url?: string; // Graphql API URL
+  url: string;
   store: object; // Internal store
-  fetchOptions: RequestInit | (() => RequestInit); // Options for fetch call
-  subscriptions: object; // Map of subscribed Connect components
+  subscriptionSize: number; // Used to generate IDs for subscriptions
   cache: ICache; // Cache object
+  exchange: IExchange; // Exchange to communicate with GraphQL APIs
+  fetchOptions: RequestInit | (() => RequestInit); // Options for fetch call
+  subscriptions: { [id: string]: (ClientEvent) => void }; // Map of subscribed Connect components
 
   constructor(opts?: IClientOptions) {
     if (!opts) {
       throw new Error('Please provide configuration object');
-    }
-    // Set option/internal defaults
-    if (!opts.url) {
+    } else if (!opts.url) {
       throw new Error('Please provide a URL for your GraphQL API');
     }
 
     this.url = opts.url;
-    this.fetchOptions = opts.fetchOptions || {};
     this.store = opts.initialCache || {};
+    this.subscriptions = Object.create(null);
+    this.subscriptionSize = 0;
     this.cache = opts.cache || defaultCache(this.store);
-    this.subscriptions = {};
+    this.fetchOptions = opts.fetchOptions || {};
+
+    const exchange = cacheExchange(this.cache, dedupExchange(httpExchange()));
+    this.exchange = opts.transformExchange
+      ? opts.transformExchange(exchange, this)
+      : exchange;
+
     // Bind methods
     this.executeQuery = this.executeQuery.bind(this);
     this.executeMutation = this.executeMutation.bind(this);
+    this.invalidateQuery = this.invalidateQuery.bind(this);
     this.updateSubscribers = this.updateSubscribers.bind(this);
     this.refreshAllFromCache = this.refreshAllFromCache.bind(this);
   }
 
-  updateSubscribers(typenames, changes) {
+  updateSubscribers(typenames: string[], changes: IExchangeResult) {
     // On mutation, call subscribed callbacks with eligible typenames
+
+    /* tslint:disable-next-line forin */
     for (const sub in this.subscriptions) {
-      if (this.subscriptions.hasOwnProperty(sub)) {
-        this.subscriptions[sub](typenames, changes);
-      }
+      this.subscriptions[sub]({
+        payload: { typenames, changes },
+        type: ClientEventType.InvalidateTypenames,
+      });
     }
   }
 
-  subscribe(
-    callback: (changedTypes: string[], response: object) => void
-  ): string {
-    // Create an identifier, add callback to subscriptions, return identifier
-    const id = uuid();
+  subscribe(callback: (event: ClientEvent) => void): () => void {
+    // Create an identifier, add callback to subscriptions
+    const id = this.subscriptionSize++;
     this.subscriptions[id] = callback;
-    return id;
-  }
 
-  unsubscribe(id: string) {
-    // Delete from subscriptions by identifier
-    delete this.subscriptions[id];
+    // Return unsubscription function
+    return () => {
+      delete this.subscriptions[id];
+    };
   }
 
   refreshAllFromCache() {
     // On mutation, call subscribed callbacks with eligible typenames
     return new Promise(resolve => {
+      /* tslint:disable-next-line forin */
       for (const sub in this.subscriptions) {
-        if (this.subscriptions.hasOwnProperty(sub)) {
-          this.subscriptions[sub](null, null, true);
-        }
+        this.subscriptions[sub]({ type: ClientEventType.RefreshAll });
       }
+
       resolve();
     });
+  }
+
+  makeContext({ skipCache }: { skipCache?: boolean }): Record<string, any> {
+    return {
+      fetchOptions:
+        typeof this.fetchOptions === 'function'
+          ? this.fetchOptions()
+          : this.fetchOptions,
+      skipCache: !!skipCache,
+      url: this.url,
+    };
+  }
+
+  executeSubscription$(
+    subscriptionObject: IQuery
+  ): Observable<IExchangeResult> {
+    // Create hash key for unique query/variables
+    const { query, variables } = subscriptionObject;
+    const key = hashString(JSON.stringify({ query, variables }));
+    const operation = {
+      context: this.makeContext({}),
+      key,
+      operationName: 'subscription',
+      query,
+      variables,
+    };
+
+    return this.exchange(operation);
+  }
+
+  executeQuery$(
+    queryObject: IQuery,
+    skipCache: boolean
+  ): Observable<IExchangeResult> {
+    // Create hash key for unique query/variables
+    const { query, variables } = queryObject;
+    const key = hashString(JSON.stringify({ query, variables }));
+    const operation = {
+      context: this.makeContext({ skipCache }),
+      key,
+      operationName: 'query',
+      query,
+      variables,
+    };
+
+    return this.exchange(operation);
   }
 
   executeQuery(
     queryObject: IQuery,
     skipCache: boolean
-  ): Promise<IQueryResponse> {
-    return new Promise<IQueryResponse>((resolve, reject) => {
-      const { query, variables } = queryObject;
-      // Create query POST body
-      const body = JSON.stringify({
-        query,
-        variables,
-      });
-
-      // Create hash from serialized body
-      const hash = hashString(body);
-
-      // Check cache for hash
-      this.cache.read(hash).then(data => {
-        if (data && !skipCache) {
-          const typeNames = gankTypeNamesFromResponse(data);
-          resolve({ data, typeNames });
-        } else {
-          const fetchOptions =
-            typeof this.fetchOptions === 'function'
-              ? this.fetchOptions()
-              : this.fetchOptions;
-          // Fetch data
-          fetch(this.url, {
-            body,
-            headers: { 'Content-Type': 'application/json' },
-            method: 'POST',
-            ...fetchOptions,
-          })
-            .then(checkStatus(fetchOptions.redirect))
-            .then(res => res.json())
-            .then(response => {
-              if (response.data) {
-                // Grab typenames from response data
-                const typeNames = gankTypeNamesFromResponse(response.data);
-                // Store data in cache, using serialized query as key
-                this.cache.write(hash, response.data);
-                resolve({
-                  data: response.data,
-                  typeNames,
-                });
-              } else {
-                reject({
-                  message: 'No data',
-                });
-              }
-            })
-            .catch(e => {
-              reject(e);
-            });
-        }
+  ): Promise<IExchangeResult> {
+    return new Promise<IExchangeResult>((resolve, reject) => {
+      this.executeQuery$(queryObject, skipCache).subscribe({
+        error: reject,
+        next: resolve,
       });
     });
   }
 
-  executeMutation(mutationObject: IMutation): Promise<object[]> {
-    return new Promise<object[]>((resolve, reject) => {
-      const { query, variables } = mutationObject;
-      // Convert POST body to string
-      const body = JSON.stringify({
-        query,
-        variables,
-      });
+  executeMutation$(
+    mutationObject: IQuery
+  ): Observable<IExchangeResult> {
+    // Create hash key for unique query/variables
+    const { query, variables } = mutationObject;
+    const key = hashString(JSON.stringify({ query, variables }));
 
-      const fetchOptions =
-        typeof this.fetchOptions === 'function'
-          ? this.fetchOptions()
-          : this.fetchOptions;
-      // Call mutation
-      fetch(this.url, {
-        body,
-        headers: { 'Content-Type': 'application/json' },
-        method: 'POST',
-        ...fetchOptions,
-      })
-        .then(checkStatus(fetchOptions.redirect))
-        .then(res => res.json())
-        .then(response => {
-          if (response.data) {
-            // Retrieve typenames from response data
-            const typeNames = gankTypeNamesFromResponse(response.data);
-            // Notify subscribed Connect wrappers
-            this.updateSubscribers(typeNames, response);
+    const operation = {
+      context: this.makeContext({}),
+      key,
+      operationName: 'mutation',
+      query,
+      variables,
+    };
 
-            resolve(response.data);
-          } else {
-            reject({
-              message: 'No data',
-            });
-          }
-        })
-        .catch(e => {
-          reject(e);
-        });
+    return this.exchange(operation).map((response: IExchangeResult) => {
+      // Notify subscribed Connect wrappers
+      this.updateSubscribers(response.typeNames, response);
+      // Resolve result
+      return response;
     });
+  }
+
+  executeMutation(mutationObject: IQuery): Promise<IExchangeResult> {
+    return new Promise<IExchangeResult>((resolve, reject) => {
+      this.executeMutation$(mutationObject).subscribe({
+        error: reject,
+        next: resolve,
+      });
+    });
+  }
+
+  invalidateQuery(queryObject: IQuery) {
+    const { query, variables } = queryObject;
+    const key = hashString(JSON.stringify({ query, variables }));
+    return this.cache.invalidate(key);
   }
 }
